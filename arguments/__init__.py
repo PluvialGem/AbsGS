@@ -82,6 +82,16 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.percent_dense = 0.001  # 0.01
         self.lambda_dssim = 0.2
+         # --- my improvement 1: Edge-Aware Residual Loss ---
+        self.use_edge_loss = False
+        self.edge_loss_weight = 0.05
+        # --- my improvement 2: Visibility-Opacity Guided Pruning ---
+        self.use_visibility_pruning = False
+        self.vop_start_iter = 7000
+        self.vop_interval = 2000
+        self.vop_min_visibility = 2
+        self.vop_opacity_threshold = 0.01
+        self.vop_max_prune_ratio = 0.03
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500

@@ -12,7 +12,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, edge_aware_residual_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -97,8 +97,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        loss.backward()
+        
+        # --- Our improvement 1: Edge-Aware Residual Loss ---
+        edge_loss_value = torch.tensor(0.0, device="cuda")
+        if opt.use_edge_loss:
+            edge_loss_value = edge_aware_residual_loss(image, gt_image)
+            loss = loss + opt.edge_loss_weight * edge_loss_value
 
+        loss.backward()
+        
         iter_end.record()
 
         with torch.no_grad():
@@ -119,6 +126,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Keep track of max weight of each GS for pruning
             gaussians.max_weight[visibility_filter] = torch.max(gaussians.max_weight[visibility_filter],
                                                                 gs_w[visibility_filter])
+            
+            # --- Our improvement 2: accumulate visibility statistics ---
+            if opt.use_visibility_pruning:
+                gaussians.add_visibility_stats(visibility_filter)
+
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
@@ -134,6 +146,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+            # --- Our improvement 2: Visibility-Opacity Guided Pruning ---
+            if opt.use_visibility_pruning:
+                if iteration > opt.vop_start_iter and iteration < opt.prune_until_iter:
+                    if iteration % opt.vop_interval == 0:
+                        pruned_num = gaussians.prune_visibility_opacity(
+                            min_visibility=opt.vop_min_visibility,
+                            opacity_threshold=opt.vop_opacity_threshold,
+                            max_prune_ratio=opt.vop_max_prune_ratio
+                         )
+                        print(f"[VOP] Iteration {iteration}: pruned {pruned_num} low-visibility low-opacity Gaussians. Remaining: {gaussians.get_xyz.shape[0]}")
 
             if iteration > opt.densify_from_iter and iteration < opt.prune_until_iter and opt.use_prune_weight:
                 if iteration % img_num / img_num_modifier == 0 and iteration % opt.opacity_reset_interval > img_num / img_num_modifier:

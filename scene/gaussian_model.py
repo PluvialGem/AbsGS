@@ -357,6 +357,101 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.max_weight = self.max_weight[valid_points_mask]
 
+        # -------------------------------------------------------------------------
+    # Our improvement 2: Visibility-Opacity Guided Pruning
+    # -------------------------------------------------------------------------
+    def _ensure_visibility_stats(self):
+        """
+        Make sure visibility statistics have the same length as current Gaussians.
+        This is necessary because densification and pruning change the number of Gaussians.
+        """
+        n_points = self.get_xyz.shape[0]
+
+        if not hasattr(self, "visibility_count"):
+            self.visibility_count = torch.zeros((n_points, 1), device="cuda")
+            return
+
+        if self.visibility_count.shape[0] != n_points:
+            old_count = self.visibility_count
+            new_count = torch.zeros((n_points, 1), device="cuda")
+
+            keep_n = min(old_count.shape[0], n_points)
+            new_count[:keep_n] = old_count[:keep_n]
+
+            self.visibility_count = new_count
+
+    def add_visibility_stats(self, visibility_filter):
+        """
+        Accumulate how many times each Gaussian is visible during training.
+        visibility_filter is produced by the renderer in train.py.
+        """
+        self._ensure_visibility_stats()
+
+        if visibility_filter is None:
+            return
+
+        self.visibility_count[visibility_filter] += 1.0
+
+    def prune_visibility_opacity(
+        self,
+        min_visibility=2,
+        opacity_threshold=0.01,
+        max_prune_ratio=0.03
+    ):
+        """
+        Remove Gaussians with both low visibility and low opacity.
+        This is a conservative pruning strategy to reduce redundant Gaussians.
+
+        A Gaussian will be pruned only if:
+        visibility_count < min_visibility
+        and opacity < opacity_threshold
+
+        max_prune_ratio limits the maximum number of pruned Gaussians each time.
+        """
+        self._ensure_visibility_stats()
+
+        n_points = self.get_xyz.shape[0]
+        if n_points == 0:
+            return 0
+
+        opacity = self.get_opacity.detach()
+
+        low_visibility = self.visibility_count.squeeze() < float(min_visibility)
+        low_opacity = opacity.squeeze() < float(opacity_threshold)
+
+        prune_mask = low_visibility & low_opacity
+
+        prune_num = int(prune_mask.sum().item())
+        max_prune_num = int(max_prune_ratio * n_points)
+
+        if max_prune_num <= 0:
+            return 0
+
+        if prune_num > max_prune_num:
+            candidate_idx = torch.where(prune_mask)[0]
+
+            # Prefer pruning Gaussians with the lowest opacity first.
+            candidate_opacity = opacity[candidate_idx].squeeze()
+            sorted_idx = torch.argsort(candidate_opacity)
+            selected_idx = candidate_idx[sorted_idx[:max_prune_num]]
+
+            final_mask = torch.zeros_like(prune_mask)
+            final_mask[selected_idx] = True
+        else:
+            final_mask = prune_mask
+
+        final_prune_num = int(final_mask.sum().item())
+        if final_prune_num > 0:
+            # Keep visibility statistics consistent after pruning.
+            keep_mask = ~final_mask
+            new_visibility_count = self.visibility_count[keep_mask].detach().clone()
+
+            self.prune_points(final_mask)
+
+            self.visibility_count = new_visibility_count
+
+        return final_prune_num
+
     def initial_prune(self):
         pts_mask_1 = torch.max(self.get_scaling, dim=1).values > torch.mean(self.get_scaling)
         if len(self.get_scaling) < 500_0000:

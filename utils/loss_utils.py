@@ -20,6 +20,75 @@ def l1_loss(network_output, gt):
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 
+def sobel_edge_map(image):
+    """
+    Compute a normalized Sobel edge map.
+
+    Args:
+        image: torch.Tensor, shape [3, H, W] or [1, 3, H, W], range [0, 1]
+
+    Returns:
+        edge: torch.Tensor, shape [1, H, W] or [1, 1, H, W]
+    """
+    input_was_3d = False
+    if image.dim() == 3:
+        image = image.unsqueeze(0)
+        input_was_3d = True
+
+    # RGB to grayscale
+    if image.shape[1] == 3:
+        gray = 0.299 * image[:, 0:1] + 0.587 * image[:, 1:2] + 0.114 * image[:, 2:3]
+    else:
+        gray = image.mean(dim=1, keepdim=True)
+
+    sobel_x = torch.tensor(
+        [[-1.0, 0.0, 1.0],
+         [-2.0, 0.0, 2.0],
+         [-1.0, 0.0, 1.0]],
+        dtype=image.dtype,
+        device=image.device
+    ).view(1, 1, 3, 3)
+
+    sobel_y = torch.tensor(
+        [[-1.0, -2.0, -1.0],
+         [ 0.0,  0.0,  0.0],
+         [ 1.0,  2.0,  1.0]],
+        dtype=image.dtype,
+        device=image.device
+    ).view(1, 1, 3, 3)
+
+    grad_x = F.conv2d(gray, sobel_x, padding=1)
+    grad_y = F.conv2d(gray, sobel_y, padding=1)
+
+    edge = torch.sqrt(grad_x * grad_x + grad_y * grad_y + 1e-12)
+
+    # Normalize per image to avoid scale explosion
+    edge_max = edge.amax(dim=(-2, -1), keepdim=True)
+    edge = edge / (edge_max + 1e-6)
+
+    if input_was_3d:
+        edge = edge.squeeze(0)
+
+    return edge
+
+
+def edge_aware_residual_loss(network_output, gt):
+    """
+    Edge-aware residual loss:
+    stronger supervision on GT image edges.
+
+    L_edge = mean( Sobel(GT) * |render - GT| )
+    """
+    with torch.no_grad():
+        edge = sobel_edge_map(gt)
+
+    if network_output.dim() == 3:
+        residual = torch.abs(network_output - gt).mean(dim=0, keepdim=True)
+    else:
+        residual = torch.abs(network_output - gt).mean(dim=1, keepdim=True)
+
+    return (edge * residual).mean()
+
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()
